@@ -1,0 +1,176 @@
+#include <Wire.h>
+#include "DFRobot_EC.h"
+#include <EEPROM.h>
+#include <DS18B20.h>
+
+// =========================================================================
+// CAPACITANCE SENSOR CONFIGURATION (EVAL-CN0552-PMDZ / AD7746)
+// =========================================================================
+#define AD7746_I2C_ADDR      0x48 
+#define AD7746_REG_CAP_DATA  0x01 
+#define AD7746_REG_CAP_SETUP 0x07 
+#define AD7746_REG_EXC_SETUP 0x09  
+#define AD7746_REG_CONFIG    0x0A  
+
+// =========================================================================
+// CALIBRATION & GEOMETRY CONSTANTS (Capacitance)
+// =========================================================================
+const float C_PARASITIC_PF = 0.0238; // Calibrated baseline for dangling jumper wires
+const float EPSILON_0 = 8.854e-12;   // Permittivity of free space (F/m)
+
+// Parallel Rod Geometry Constants (UPDATE THESE TO MATCH YOUR PHYSICAL BUILD)
+const float ROD_LENGTH_M = 0.0254;        // L: Length of the parallel overlapping rods (m)
+const float ROD_DISTANCE_M = 0.008;      // D: Distance between the centers of the rods (m)
+const float ROD_RADIUS_M = 0.00204;   // r: Radius of 1/8" rod (1/16" converted to meters)
+
+// =========================================================================
+// EC & TEMPERATURE SENSOR CONFIGURATION
+// =========================================================================
+#define EC_PIN A1
+#define DS_PIN 44
+
+// Global Variables & Objects
+float voltage = 0.0, ecValue = 0.0, temperature = 22.0;
+DFRobot_EC ec;
+DS18B20 ds(DS_PIN);
+uint8_t selected = 0;
+
+// --- Timers ---
+unsigned long lastPrintTime = 0;
+
+// =========================================================================
+// CAPACITANCE HELPER FUNCTIONS
+// =========================================================================
+
+void initCN0552() {
+  // 1. Configure Capacitance Setup (0x07)
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CAP_SETUP);
+  Wire.write(0x80); // Enable Capacitance, Single-Ended Mode
+  Wire.endTransmission();
+
+  // 2. Configure Excitation Output (0x09)
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_EXC_SETUP);
+  Wire.write(0x0B); // Enable EXCA at maximum VDD level
+  Wire.endTransmission();
+
+  // 3. Configure Configuration Register (0x0A)
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CONFIG);
+  Wire.write(0xA1); // Continuous conversion mode, 62ms sample rate
+  Wire.endTransmission();
+}
+
+float readCapacitancePF() {
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CAP_DATA);
+  Wire.endTransmission(false); 
+
+  Wire.requestFrom((uint8_t)AD7746_I2C_ADDR, (uint8_t)3);
+  if (Wire.available() == 3) {
+    uint32_t rawData = ((uint32_t)Wire.read() << 16) | 
+                       ((uint32_t)Wire.read() << 8)  | 
+                        (uint32_t)Wire.read();
+    
+    return ((float)rawData - 8388608.0) * (4.096 / 8388608.0);
+  }
+  return -999.0; 
+}
+
+float calculateDielectricConstant(float rawCapacitancePF) {
+  float netCapacitancePF = rawCapacitancePF - C_PARASITIC_PF;
+  if (netCapacitancePF <= 0.0) return 1.0; 
+
+  float capacitanceF = netCapacitancePF * 1e-12; // Convert to Farads
+  
+  // 1. Calculate the ratio (D / 2r)
+  float x = ROD_DISTANCE_M / (2.0 * ROD_RADIUS_M);
+  
+  // 2. Apply logarithmic identity for acosh(x): ln(x + sqrt(x^2 - 1))
+  float geometricFactor = log(x + sqrt((x * x) - 1.0));
+  
+  // 3. Complete the parallel rod formula
+  float er = (capacitanceF * geometricFactor) / (PI * EPSILON_0 * ROD_LENGTH_M);
+
+  return er;
+}
+
+// =========================================================================
+// TEMPERATURE HELPER FUNCTION
+// =========================================================================
+
+float readTemperature() {
+  if (selected) {
+    return ds.getTempC();
+  } else {
+    return 22.0; // Fallback temperature if sensor disconnected
+  }
+}
+
+// =========================================================================
+// SETUP
+// =========================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000); // Allow power rails and serial monitor to stabilize
+  
+  Wire.begin();
+  
+  // Initialize Capacitance Sensor
+  initCN0552();
+  
+  // Initialize EC Sensor
+  ec.begin();
+
+  // Initialize DS18B20 Temperature Sensor
+  if (ds.selectNext()) {
+    selected = 1;
+    Serial.println("DS18B20 Temperature Sensor detected.");
+  } else {
+    selected = 0;
+    Serial.println("Warning: DS18B20 not found! Defaulting to 22.0 C fallback.");
+  }
+
+  delay(1000);
+
+  // Output Combined CSV Header
+  Serial.println("Time_sec,Raw_Capacitance_pF,Dielectric_Constant_Er,Temperature_C,EC_ms_cm");
+}
+
+// =========================================================================
+// LOOP
+// =========================================================================
+
+void loop() {
+  // Read analog voltage from EC sensor continuously for calibration checks
+  voltage = analogRead(EC_PIN) / 1024.0 * 5000;
+
+  // Log all sensor data every 1000ms (1 second) non-blocking
+  if (millis() - lastPrintTime >= 1000U) {
+    lastPrintTime = millis();
+    float timeInSeconds = lastPrintTime / 1000.0;
+
+    // --- Read Capacitance & Compute Dielectric ---
+    float capacitance = readCapacitancePF();
+    float dielectricConstant = -1.0; 
+    if (capacitance != -999.0) {
+      dielectricConstant = calculateDielectricConstant(capacitance);
+    }
+
+    // --- Read Temperature & Calculate EC ---
+    temperature = readTemperature();
+    ecValue = ec.readEC(voltage, temperature);
+
+    // --- Print Combined CSV Line ---
+    Serial.print(timeInSeconds, 2);      Serial.print(",");
+    Serial.print(capacitance, 4);        Serial.print(",");
+    Serial.print(dielectricConstant, 4); Serial.print(",");
+    Serial.print(temperature, 1);        Serial.print(",");
+    Serial.println(ecValue, 2);
+  }
+
+  // Listens continuously for Serial calibration commands (enterec, calec, exitec)
+  ec.calibration(voltage, temperature);
+}
