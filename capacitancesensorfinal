@@ -1,0 +1,122 @@
+#include <Wire.h>
+
+// =========================================================================
+// CAPACITANCE SENSOR CONFIGURATION (EVAL-CN0552-PMDZ / AD7746)
+// =========================================================================
+#define AD7746_I2C_ADDR      0x48 
+#define AD7746_REG_CAP_DATA  0x01 
+#define AD7746_REG_CAP_SETUP 0x07 
+#define AD7746_REG_EXC_SETUP 0x09  
+#define AD7746_REG_CONFIG    0x0A  
+
+// =========================================================================
+// CALIBRATION & GEOMETRY CONSTANTS
+// =========================================================================
+const float C_PARASITIC_PF = 0.0238; // Calibrated baseline for dangling jumper wires
+const float EPSILON_0 = 8.854e-12;   // Permittivity of free space (F/m)
+
+// Parallel Rod Geometry Constants (UPDATE THESE TO MATCH YOUR PHYSICAL BUILD)
+const float ROD_LENGTH_M = 0.0254;        // L: Length of the parallel overlapping rods (m)
+const float ROD_DISTANCE_M = 0.008;      // D: Distance between the centers of the rods (m)
+const float ROD_RADIUS_M = 0.00204;   // r: Radius of 1/8" rod (1/16" converted to meters)
+
+// --- Timers ---
+unsigned long lastPrintTime = 0;
+
+// =========================================================================
+// CAPACITANCE HELPER FUNCTIONS
+// =========================================================================
+
+void initCN0552() {
+  Wire.begin();
+
+  // 1. Configure Capacitance Setup (0x07)
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CAP_SETUP);
+  Wire.write(0x80); // Enable Capacitance, Single-Ended Mode
+  Wire.endTransmission();
+
+  // 2. Configure Excitation Output (0x09)
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_EXC_SETUP);
+  Wire.write(0x0B); // Enable EXCA at maximum VDD level
+  Wire.endTransmission();
+
+  // 3. Configure Configuration Register (0x0A)
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CONFIG);
+  Wire.write(0xA1); // Continuous conversion mode, 62ms sample rate
+  Wire.endTransmission();
+}
+
+float readCapacitancePF() {
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CAP_DATA);
+  Wire.endTransmission(false); 
+
+  Wire.requestFrom((uint8_t)AD7746_I2C_ADDR, (uint8_t)3);
+  if (Wire.available() == 3) {
+    uint32_t rawData = ((uint32_t)Wire.read() << 16) | 
+                       ((uint32_t)Wire.read() << 8)  | 
+                        (uint32_t)Wire.read();
+    
+    return ((float)rawData - 8388608.0) * (4.096 / 8388608.0);
+  }
+  return -999.0; 
+}
+
+float calculateDielectricConstant(float rawCapacitancePF) {
+  float netCapacitancePF = rawCapacitancePF - C_PARASITIC_PF;
+  if (netCapacitancePF <= 0.0) return 1.0; 
+
+  float capacitanceF = netCapacitancePF * 1e-12; // Convert to Farads
+  
+  // 1. Calculate the ratio (D / 2r)
+  float x = ROD_DISTANCE_M / (2.0 * ROD_RADIUS_M);
+  
+  // 2. Apply logarithmic identity for acosh(x): ln(x + sqrt(x^2 - 1))
+  float geometricFactor = log(x + sqrt((x * x) - 1.0));
+  
+  // 3. Complete the parallel rod formula
+  float er = (capacitanceF * geometricFactor) / (PI * EPSILON_0 * ROD_LENGTH_M);
+
+  return er;
+}
+
+// =========================================================================
+// SETUP
+// =========================================================================
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  
+  initCN0552();
+  delay(1000);
+
+  // Output Header
+  Serial.println("Time_sec,Raw_Capacitance_pF,Dielectric_Constant_Er");
+}
+
+// =========================================================================
+// LOOP
+// =========================================================================
+
+void loop() {
+  if (millis() - lastPrintTime >= 500U) {
+    lastPrintTime = millis();
+    float timeInSeconds = lastPrintTime / 1000.0;
+
+    // --- Read Capacitance & Compute Dielectric ---
+    float capacitance = readCapacitancePF();
+    float dielectricConstant = -1.0; 
+    if (capacitance != -999.0) {
+      dielectricConstant = calculateDielectricConstant(capacitance);
+    }
+
+    // --- Print CSV Line ---
+    Serial.print(timeInSeconds, 2);      Serial.print(",");
+    Serial.print(capacitance, 4);        Serial.print(",");
+    Serial.println(dielectricConstant, 4);
+  }
+}
