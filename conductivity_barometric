@@ -1,0 +1,73 @@
+/*
+ * Integrated DFRobot EC Sensor and DS18B20 Temperature Sensor
+ * Hardware Connections:
+ *   - EC Sensor Analog Output -> Pin A1
+ *   - DS18B20 Data Line        -> Digital Pin 44 (with 4.7k ohm pull-up resistor to 5V/3.3V)
+ *
+ * Calibration Serial Commands (Serial Monitor at 115200 baud):
+ *   enterec -> enter calibration mode
+ *   calec   -> calibrate using standard buffer solution
+ *   exitec  -> save calibration and exit
+ */
+
+#include "DFRobot_EC.h"
+#include <EEPROM.h>
+#include <DS18B20.h>
+
+// Pin Definitions
+#define EC_PIN A1
+#define DS_PIN 44
+
+// Global Variables & Objects
+float voltage, ecValue, temperature = 22.0;
+DFRobot_EC ec;
+DS18B20 ds(DS_PIN);
+uint8_t selected = 0;
+
+void setup()
+{
+  Serial.begin(115200); // 115200 baud rate required for DFRobot calibration
+  ec.begin();
+
+  // Dynamically detect and select the DS18B20 without hardcoded addresses
+  if (ds.selectNext()) {
+    selected = 1;
+    Serial.println("DS18B20 Temperature Sensor detected on Pin");
+  } else {
+    selected = 0;
+    Serial.println("Warning: DS18B20 not found on Pin! Defaulting to 22.0 C fallback.");
+  }
+}
+
+void loop()
+{
+  static unsigned long timepoint = millis();
+
+  // Read sensors every 1000ms (1 second) non-blocking
+  if (millis() - timepoint > 1000U)
+  {
+    timepoint = millis();
+    
+    voltage = analogRead(EC_PIN) / 1024.0 * 5000;  // Read analog voltage from EC sensor
+    temperature = readTemperature();              // Read live temperature from DS18B20
+    ecValue = ec.readEC(voltage, temperature);     // Calculate EC with temperature compensation
+    
+    Serial.print("temperature:");
+    Serial.print(temperature, 1);
+    Serial.print("^C  EC:");
+    Serial.print(ecValue, 2);
+    Serial.println("ms/cm");
+  }
+
+  // Listens continuously for Serial calibration commands (enterec, calec, exitec)
+  ec.calibration(voltage, temperature);
+}
+
+float readTemperature()
+{
+  if (selected) {
+    return ds.getTempC();
+  } else {
+    return 22.0; // Fallback temperature if sensor disconnected
+  }
+}
