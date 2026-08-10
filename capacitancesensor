@@ -1,0 +1,120 @@
+#include <Wire.h>
+
+// --- AD7746 REGISTER DEFINITIONS (Core IC on EVAL-CN0552-PMDZ) ---
+#define AD7746_I2C_ADDR      0x48  
+#define AD7746_REG_CAP_DATA  0x01  
+#define AD7746_REG_CAP_SETUP 0x07  // Capacitance Setup Register
+#define AD7746_REG_EXC_SETUP 0x09  // Excitation Setup Register
+#define AD7746_REG_CONFIG    0x0A  // Configuration Register
+
+// =========================================================================
+// CAPACITOR GEOMETRY & CONSTANTS
+// =========================================================================
+const float C_PARASITIC_PF = 0.0238;  // Watch the Serial Monitor to update this!
+
+// Physics Constants
+const float EPSILON_0 = 8.854e-12;   
+
+// Physical Dimensions
+const float PLATE_AREA_M2 = 7.69446726699e-6;
+const float PLATE_DISTANCE_M = 0.08; 
+
+// =========================================================================
+// EVAL-CN0552-PMDZ (AD7746) DRIVER FUNCTIONS
+// =========================================================================
+
+void initCN0552() {
+  Wire.begin();
+
+  // 1. Configure Capacitance Setup (0x07)
+  // 0x80 = Enable Capacitance conversion, Single-Ended Mode (CIN1)
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CAP_SETUP);
+  Wire.write(0x80);
+  Wire.endTransmission();
+
+  // 2. Configure Excitation Output (0x09)
+  // 0x0B = Enable Excitation Pin A (EXCA), set voltage to maximum VDD level
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_EXC_SETUP);
+  Wire.write(0x0B);
+  Wire.endTransmission();
+
+  // 3. Configure Configuration Register (0x0A)
+  // 0xA1 = Continuous conversion mode, 62ms sample rate
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CONFIG);
+  Wire.write(0xA1);
+  Wire.endTransmission();
+}
+
+float readCapacitancePF() {
+  Wire.beginTransmission(AD7746_I2C_ADDR);
+  Wire.write(AD7746_REG_CAP_DATA);
+  Wire.endTransmission(false); // Send repeated start
+
+  // Request 3 bytes of raw 24-bit capacitance data
+  Wire.requestFrom((uint8_t)AD7746_I2C_ADDR, (uint8_t)3);
+  if (Wire.available() == 3) {
+    uint32_t rawData = ((uint32_t)Wire.read() << 16) | 
+                       ((uint32_t)Wire.read() << 8)  | 
+                        (uint32_t)Wire.read();
+
+    // AD7746 24-bit conversion formula (Full Scale Range = ±4.096 pF)
+    float capacitancePF = ((float)rawData - 8388608.0) * (4.096 / 8388608.0);
+    return capacitancePF;
+  }
+
+  return -999.0; // Return error flag if I2C read fails
+}
+
+float calculateDielectricConstant(float rawCapacitancePF) {
+  // 1. Remove parasitic wire capacitance to get true fluid capacitance
+  float netCapacitancePF = rawCapacitancePF - C_PARASITIC_PF;
+
+  if (netCapacitancePF <= 0.0) {
+    return 1.0; // Protect against division by zero or negative math
+  }
+
+  // 2. Convert capacitance from picoFarads (pF) to Farads (F) for the equation
+  float capacitanceF = netCapacitancePF * 1e-12;
+
+  // 3. Apply the rearranged physics formula: Er = (C * d) / (E0 * A)
+  float er = (capacitanceF * PLATE_DISTANCE_M) / (EPSILON_0 * PLATE_AREA_M2);
+
+  return er;
+}
+
+// =========================================================================
+// MAIN PROGRAM
+// =========================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Startup delay for power stabilization
+
+  Serial.println("Initializing EVAL-CN0552-PMDZ Capacitance Sensor...");
+  initCN0552();
+  Serial.println("Initialization Complete.");
+  Serial.println("Time_sec,Raw_Capacitance_pF,Dielectric_Constant_Er");
+}
+
+void loop() {
+  float timeInSeconds = millis() / 1000.0;
+  float capacitance = readCapacitancePF();
+
+  if (capacitance != -999.0) {
+    float dielectricConstant = calculateDielectricConstant(capacitance);
+
+    // CSV Output Stream
+    Serial.print(timeInSeconds, 2);
+    Serial.print(",");
+    Serial.print(capacitance, 4);
+    Serial.print(",");
+    Serial.println(dielectricConstant, 4);
+  } else {
+    Serial.println("ERROR: EVAL-CN0552-PMDZ I2C communication failed!");
+  }
+
+  delay(500); // 2 Hz update rate
+}
